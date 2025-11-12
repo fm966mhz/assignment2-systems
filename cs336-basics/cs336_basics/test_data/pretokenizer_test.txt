@@ -1,0 +1,3 @@
+test <|endoftext|>
+hello, another test <|pad|> 测试 中文 <|endoftext|>
+另外一个test
