@@ -6,15 +6,26 @@ import timeit
 from typing import Any
 from typing import Callable
 
+import cs336_basics
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 
 from absl import app
 from absl import flags
 from absl import logging
 from jaxtyping import Int
+from torch import optim
+
+import cs336_basics.functions
+from cs336_systems import annotated_functions
+
+cs336_basics.functions.scaled_dot_product_attention = (
+    annotated_functions.annotated_scaled_dot_product_attention
+)
 
 from cs336_basics import functions as F
+from cs336_basics import optimizers as O
 from cs336_basics import transformer
 from cs336_systems import predefined_model_configs
 
@@ -95,6 +106,7 @@ def _get_random_test_batch() -> tuple[
 
 def run_one_step(
     model: Callable[..., Any] | transformer.TransformerLm,
+    optimizer: optim.Optimizer,
     input_seq: Int[torch.Tensor, "batch_size context_length"],
     label_seq: Int[torch.Tensor, "batch_size context_length"],
 ) -> None:
@@ -105,26 +117,31 @@ def run_one_step(
             torch.cuda.synchronize()
         return
     loss.backward()
+    optimizer.step()
     if FLAGS.device.startswith("cuda"):
         torch.cuda.synchronize()
 
 
 def run_warmup_steps(
     model: Callable[..., Any] | transformer.TransformerLm,
+    optimizer: optim.Optimizer,
     input_seq: Int[torch.Tensor, "batch_size context_length"],
     label_seq: Int[torch.Tensor, "batch_size context_length"],
 ) -> None:
     """Run the warmup steps."""
-    for _ in range(FLAGS.num_warmup_steps):
-        run_one_step(
-            model=model,
-            input_seq=input_seq,
-            label_seq=label_seq,
-        )
+    with nvtx.range("run_warmup_steps"):
+        for _ in range(FLAGS.num_warmup_steps):
+            run_one_step(
+                model=model,
+                optimizer=optimizer,
+                input_seq=input_seq,
+                label_seq=label_seq,
+            )
 
 
 def run_benchmarking_steps(
     model: Callable[..., Any] | transformer.TransformerLm,
+    optimizer: optim.Optimizer,
     input_seq: Int[torch.Tensor, "batch_size context_length"],
     label_seq: Int[torch.Tensor, "batch_size context_length"],
 ) -> tuple[float, float]:
@@ -133,11 +150,17 @@ def run_benchmarking_steps(
     Returns:
         Tuple of average and standard deviation of one step time.
     """
-    step_times = timeit.repeat(
-        lambda: run_one_step(model=model, input_seq=input_seq, label_seq=label_seq),
-        number=1,
-        repeat=FLAGS.num_benchmarking_steps,
-    )
+    with nvtx.range("run_benchmarking_steps"):
+        step_times = timeit.repeat(
+            lambda: run_one_step(
+                model=model,
+                optimizer=optimizer,
+                input_seq=input_seq,
+                label_seq=label_seq,
+            ),
+            number=1,
+            repeat=FLAGS.num_benchmarking_steps,
+        )
     return float(np.mean(step_times)), float(np.std(step_times))
 
 
@@ -151,12 +174,14 @@ def main(argv):
 
     model_config = _get_model_config()
     model = transformer.TransformerLm(model_config, device=FLAGS.device)
+    optimizer = O.AdamW(model.parameters(), lr=1e-3)
     if FLAGS.torch_compile:
         model = torch.compile(model)
     input_seq, label_seq = _get_random_test_batch()
     logging.info(f"Running {FLAGS.num_warmup_steps} warmup steps...")
     run_warmup_steps(
         model=model,
+        optimizer=optimizer,
         input_seq=input_seq,
         label_seq=label_seq,
     )
@@ -165,6 +190,7 @@ def main(argv):
     logging.info(f"Running {FLAGS.num_benchmarking_steps} benchmarking steps...")
     mean, std = run_benchmarking_steps(
         model=model,
+        optimizer=optimizer,
         input_seq=input_seq,
         label_seq=label_seq,
     )
