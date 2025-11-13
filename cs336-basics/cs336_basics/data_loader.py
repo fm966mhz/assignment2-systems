@@ -44,8 +44,13 @@ def get_batch(
     for i in range(0, context_length):
         selected_ranges.append(selected_start_ids + i)
     selected_ranges = np.stack(selected_ranges, axis=-1)
-    inputs = torch.tensor(dataset[selected_ranges], device=device, dtype=torch.int64)
-    labels = torch.tensor(
-        dataset[selected_ranges + 1], device=device, dtype=torch.int64
-    )
+    inputs = torch.tensor(dataset[selected_ranges], dtype=torch.int64)
+    labels = torch.tensor(dataset[selected_ranges + 1], dtype=torch.int64)
+    if str(device).startswith("cuda"):
+        inputs = inputs.pin_memory().to(device)
+        labels = labels.pin_memory().to(device)
+    else:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+
     return inputs, labels
