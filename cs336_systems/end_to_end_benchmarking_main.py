@@ -1,5 +1,6 @@
 """End-to-end benchmarking main."""
 
+import contextlib
 import random
 import timeit
 
@@ -62,6 +63,13 @@ flags.DEFINE_bool(
 flags.DEFINE_bool(
     "torch_compile", False, "If true, uses torch.compile to compile the model."
 )
+flags.DEFINE_bool("autocast", False, "If true, uses torch.autocast to run the model.")
+flags.DEFINE_enum(
+    "autocast_dtype",
+    "bfloat16",
+    ["float32", "bfloat16"],
+    "The dtype to use for the autocast.",
+)
 
 
 def _get_model_config() -> transformer.TransformerConfig:
@@ -104,22 +112,41 @@ def _get_random_test_batch() -> tuple[
     return input_seq, label_seq
 
 
+def _get_auto_cast_type() -> torch.dtype:
+    if FLAGS.autocast_dtype == "bfloat16":
+        return torch.bfloat16
+    elif FLAGS.autocast_dtype == "float32":
+        return torch.float32
+    else:
+        raise ValueError(
+            f"Invalid autocast dtype: {FLAGS.autocast_dtype}. Must be one of: float32, bfloat16."
+        )
+
+
 def run_one_step(
     model: Callable[..., Any] | transformer.TransformerLm,
     optimizer: optim.Optimizer,
     input_seq: Int[torch.Tensor, "batch_size context_length"],
     label_seq: Int[torch.Tensor, "batch_size context_length"],
 ) -> None:
-    logits = model(input_seq)
-    loss = F.cross_entropy(logits=logits, targets=label_seq)
-    if FLAGS.forward_pass_only:
+    if FLAGS.autocast:
+        run_context = torch.autocast(
+            device_type=FLAGS.device, dtype=_get_auto_cast_type()
+        )
+    else:
+        run_context = contextlib.nullcontext()
+    with run_context:
+        optimizer.zero_grad()
+        logits = model(input_seq)
+        loss = F.cross_entropy(logits=logits, targets=label_seq)
+        if FLAGS.forward_pass_only:
+            if FLAGS.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            return
+        loss.backward()
+        optimizer.step()
         if FLAGS.device.startswith("cuda"):
             torch.cuda.synchronize()
-        return
-    loss.backward()
-    optimizer.step()
-    if FLAGS.device.startswith("cuda"):
-        torch.cuda.synchronize()
 
 
 def run_warmup_steps(
