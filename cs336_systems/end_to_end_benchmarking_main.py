@@ -70,6 +70,12 @@ flags.DEFINE_enum(
     ["float32", "bfloat16"],
     "The dtype to use for the autocast.",
 )
+flags.DEFINE_bool(
+    "profile_memory", False, "If true, profiles the memory usage of the model."
+)
+flags.DEFINE_string(
+    "profile_memory_output_path", None, "The path to save the profile memory output."
+)
 
 
 def _get_model_config() -> transformer.TransformerConfig:
@@ -135,7 +141,11 @@ def run_one_step(
         )
     else:
         run_context = contextlib.nullcontext()
-    with run_context:
+    if FLAGS.forward_pass_only:
+        grad_context = torch.no_grad()
+    else:
+        grad_context = contextlib.nullcontext()
+    with run_context, grad_context:
         optimizer.zero_grad()
         logits = model(input_seq)
         loss = F.cross_entropy(logits=logits, targets=label_seq)
@@ -177,6 +187,11 @@ def run_benchmarking_steps(
     Returns:
         Tuple of average and standard deviation of one step time.
     """
+    if FLAGS.profile_memory and FLAGS.device.startswith("cuda"):
+        assert (
+            FLAGS.profile_memory_output_path is not None
+        ), "Profile memory output path must be provided if profile memory is enabled."
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     with nvtx.range("run_benchmarking_steps"):
         step_times = timeit.repeat(
             lambda: run_one_step(
@@ -188,6 +203,9 @@ def run_benchmarking_steps(
             number=1,
             repeat=FLAGS.num_benchmarking_steps,
         )
+    if FLAGS.profile_memory and FLAGS.device.startswith("cuda"):
+        torch.cuda.memory._dump_snapshot(FLAGS.profile_memory_output_path)
+        torch.cuda.memory._record_memory_history(enabled=None)
     return float(np.mean(step_times)), float(np.std(step_times))
 
 
