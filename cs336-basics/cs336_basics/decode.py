@@ -17,6 +17,7 @@ def decode(
     temperature: float,
     top_p: float,
     eps: float = 1e-8,
+    max_model_context_length: int = 1024,
     device: torch.device | str | None = None,
 ) -> Int[torch.Tensor, "seq_len"]:
     """Runs decoding."""
@@ -28,11 +29,12 @@ def decode(
         model = model.to(device)
         input_tokens = input_tokens.to(device)
     for _ in range(max_output_length):
-        logits: Float[torch.Tensor, "vocab_size"] = model(
-            torch.cat(
-                (input_tokens, torch.tensor(output, dtype=torch.int64, device=device))
-            )
-        )[-1]
+        model_input_tokens = torch.cat(
+            (input_tokens, torch.tensor(output, dtype=torch.int64, device=device))
+        )
+        if model_input_tokens.shape[-1] > max_model_context_length:
+            model_input_tokens = model_input_tokens[-max_model_context_length:]
+        logits: Float[torch.Tensor, "vocab_size"] = model(model_input_tokens)[-1]
         probs = F.softmax(x=logits / (temperature + eps), dim=-1)
         new_token_idx = nucleus_sample(probs, top_p).cpu().item()
         output.append(new_token_idx)
@@ -42,7 +44,7 @@ def decode(
 
 
 def nucleus_sample(
-    input_probs: Float[torch.Tensor, "vocab"], top_p: float
+    input_probs: Float[torch.Tensor, "vocab_size"], top_p: float
 ) -> Int[torch.Tensor, ""]:
     """Runs one nucleus sampling."""
     sorted_probs, token_ids = torch.sort(input_probs, dim=-1, descending=True)

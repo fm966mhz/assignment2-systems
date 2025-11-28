@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Note: BASE_DIR is the script path; change to dirname if you want the script directory.
 BASE_DIR="$1"
-EXP_NAME="default_owt_on_5080_debug_memory"
+EXP_NAME="default_owt_on_5080_debug_memory_test"
 
 # Input data.
 TRAINING_DATASET_PATH="${BASE_DIR}/data/owt_train_tokens.npy"
