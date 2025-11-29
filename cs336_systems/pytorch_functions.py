@@ -100,6 +100,7 @@ class FlashAttention2Torch(torch.autograd.Function):
             )
             L[:, s * q_tile_size : (s + 1) * q_tile_size] = m_s + torch.log(l_s)
         ctx.save_for_backward(O, L, Q, K, V)
+        ctx.is_causal = is_causal  # type: ignore
         return O.view(input_batch_shape + (S, D))
 
     @staticmethod
@@ -110,6 +111,60 @@ class FlashAttention2Torch(torch.autograd.Function):
         Float[torch.Tensor, "... S D"],
         Float[torch.Tensor, "... T D"],
         Float[torch.Tensor, "... T D"],
+        None,
+        None,
+        None,
     ]:
         """Backward pass."""
-        raise NotImplementedError("Not implemented.")
+        (dO,) = grad_outputs
+        O, L, Q, K, V = ctx.saved_tensors  # type: ignore
+        input_batch_shape = dO.shape[:-2]
+        S, D = dO.shape[-2:]
+        T = K.shape[-2]
+        dO = dO.view((-1, S, D))
+
+        def _backward_impl(
+            dO: Float[torch.Tensor, "B S D"],
+            O: Float[torch.Tensor, "B S D"],
+            L: Float[torch.Tensor, "B S"],
+            Q: Float[torch.Tensor, "B S D"],
+            K: Float[torch.Tensor, "B T D"],
+            V: Float[torch.Tensor, "B T D"],
+            sqrt_d: float,
+            is_causal: bool = False,
+        ) -> tuple[
+            Float[torch.Tensor, "B S D"],
+            Float[torch.Tensor, "B T D"],
+            Float[torch.Tensor, "B T D"],
+        ]:
+            S = einops.einsum(Q, K, "B S D, B T D -> B S T") / sqrt_d
+            q_seq_len, k_seq_len = S.shape[-2:]
+            # Let S' = S + causal_mask, we have dS' = dS, so we only need to update S for the
+            # situations with `is_causal = True`.
+            if is_causal:
+                S = torch.where(
+                    torch.arange(q_seq_len, device=S.device)[None, :, None]
+                    >= torch.arange(k_seq_len, device=S.device)[None, None, :],
+                    S,
+                    -1e6,
+                )
+            P = torch.exp(S - L.unsqueeze(dim=-1))
+            dV = einops.einsum(P, dO, "B S T, B S D -> B T D")
+            dP = einops.einsum(dO, V, "B S D, B T D -> B S T")
+            dS = P * (dP - einops.reduce(O * dO, "B S D -> B S 1", reduction="sum"))
+            dQ = einops.einsum(dS, K, "B S T, B T D -> B S D") / sqrt_d
+            dK = einops.einsum(dS, Q, "B S T, B S D -> B T D") / sqrt_d
+            return dQ, dK, dV
+
+        compiled_backward_impl = torch.compile(_backward_impl)
+        dQ, dK, dV = compiled_backward_impl(
+            dO, O, L, Q, K, V, np.sqrt(D), ctx.is_causal  # type:ignore
+        )
+        return (
+            dQ.view(input_batch_shape + (S, D)),
+            dK.view(input_batch_shape + (T, D)),
+            dV.view(input_batch_shape + (T, D)),
+            None,
+            None,
+            None,
+        )
