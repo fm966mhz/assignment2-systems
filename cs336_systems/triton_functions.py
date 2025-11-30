@@ -278,11 +278,11 @@ def flash_fwd_kernal(
     # L strides.
     stride_l_b: int,
     stride_l_s: int,
-    sqrt_D: float,
+    S: int,
+    T: int,
+    D: int,
+    scale_factor: float,
     is_causal: tl.constexpr,
-    S: tl.constexpr,
-    T: tl.constexpr,
-    D: tl.constexpr,
     D_BLOCK_SHAPE: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -297,7 +297,7 @@ def flash_fwd_kernal(
         strides=(stride_q_s, stride_q_d),
         offsets=(q_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
-        order=(0, 1),
+        order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
         K_ptr + batch_index * stride_k_b,
@@ -305,7 +305,7 @@ def flash_fwd_kernal(
         strides=(stride_k_t, stride_k_d),
         offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
-        order=(0, 1),
+        order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
         V_ptr + batch_index * stride_v_b,
@@ -313,7 +313,7 @@ def flash_fwd_kernal(
         strides=(stride_v_t, stride_v_d),
         offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
-        order=(0, 1),
+        order=(1, 0),
     )
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_o_b,
@@ -321,7 +321,7 @@ def flash_fwd_kernal(
         strides=(stride_o_s, stride_o_d),
         offsets=(q_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
-        order=(0, 1),
+        order=(1, 0),
     )
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_l_b,
@@ -336,8 +336,7 @@ def flash_fwd_kernal(
     o_s = tl.zeros((Q_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
     l_s = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_s = tl.full((Q_TILE_SIZE,), -1.0e6, dtype=tl.float32)
-    if is_causal:
-        q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
     for k_tile_index in range(tl.cdiv(T, K_TILE_SIZE)):
         k_t = tl.trans(
             tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero"), (1, 0)
@@ -345,7 +344,7 @@ def flash_fwd_kernal(
         v_t = tl.load(
             V_block_ptr, boundary_check=(0, 1), padding_option="zero"
         )  # K_TILE_SIZE D
-        S_st = tl.dot(q_s, k_t) / sqrt_D  # Q_TILE_SIZE K_TILE_SIZE
+        S_st = tl.dot(q_s, k_t) * scale_factor  # Q_TILE_SIZE K_TILE_SIZE
         if is_causal:
             k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
             causal_mask_matrix = tl.where(
@@ -404,12 +403,18 @@ class FlashAttention2(torch.autograd.Function):
         Q = Q.view((-1, S, D))
         K = K.view((-1, T, D))
         V = V.view((-1, T, D))
-        sqrt_D = np.sqrt(D)
+        scale_factor = 1.0 / (D**0.5)
         num_tiles_q = triton.cdiv(S, q_tile_size)
         # 16 is the min size of the inner dimension for dot product.
         d_block_shape = max(16, triton.next_power_of_2(D))  # type: ignore
-        O = torch.empty_like(Q).to(Q.device)
-        L = torch.empty(Q.shape[:-1]).to(Q.device)
+        O = torch.empty_like(Q, dtype=Q.dtype).to(Q.device)
+        # CRITICAL NOTE FOR USING `torch.zeros` instead of `torch.empty`.
+        # `torch.empty((B, S))` creates a FAKE TENSOR that has no dependency in the main computation
+        # graph. It will be aggressively optimized away by `torch.compile` (Inductor) and never gets
+        # materialized. When the Triton kernel tries to write to it, it will cause an illegal memory
+        # access error and crash the program!
+
+        L = torch.zeros(Q.shape[:-1], dtype=Q.dtype).to(Q.device)
         flash_fwd_kernal[(num_tiles_q, Q.shape[0])](
             Q,  # type: ignore
             K,  # type: ignore
@@ -430,11 +435,11 @@ class FlashAttention2(torch.autograd.Function):
             O.stride(2),
             L.stride(0),
             L.stride(1),
-            sqrt_D,
-            is_causal,  # type: ignore
             S,  # type: ignore
             T,  # type: ignore
             D,  # type: ignore
+            scale_factor,  # type: ignore
+            is_causal,  # type: ignore
             d_block_shape,  # type:ignore
             q_tile_size,  # type: ignore
             k_tile_size,  # type: ignore

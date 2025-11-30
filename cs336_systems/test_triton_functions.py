@@ -78,9 +78,32 @@ def test_flash_attention_foward(with_head, is_causal):
     expected_o = functions.scaled_dot_product_attention(q=q, k=k, v=v, mask=causal_mask)
     actual_o = triton_functions.FlashAttention2.apply(q, k, v, is_causal)
 
-    np.testing.assert_allclose(
-        actual_o.detach().cpu().numpy(),
-        expected_o.detach().cpu().numpy(),
+    torch.testing.assert_close(
+        actual_o,
+        expected_o,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "with_head, is_causal", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_flash_attention_foward_compiled(with_head, is_causal):
+    q, k, v, _ = get_attention_inputs(with_head, device=torch.device("cuda"))
+    causal_mask = (
+        torch.tril(torch.ones((q.shape[-2], k.shape[-2]))).to(
+            dtype=torch.bool, device="cuda"
+        )
+        if is_causal
+        else None
+    )
+    expected_o = functions.scaled_dot_product_attention(q=q, k=k, v=v, mask=causal_mask)
+    actual_o = torch.compile(triton_functions.FlashAttention2.apply)(q, k, v, is_causal)
+
+    torch.testing.assert_close(
+        actual_o,
+        expected_o,
         atol=1e-2,
         rtol=1e-2,
     )
@@ -104,6 +127,32 @@ def test_flash_attention_backward(with_head, is_causal):
     q, k, v, do = get_attention_inputs(with_head, device=torch.device("cuda"))
 
     triton_functions.FlashAttention2.apply(q, k, v, is_causal).backward(do)
+
+    torch.testing.assert_close(q.grad, expected_dq, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k.grad, expected_dk, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v.grad, expected_dv, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "with_head, is_causal",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_flash_attention_backward_compiled(with_head, is_causal):
+    q, k, v, do = get_attention_inputs(with_head, device=torch.device("cuda"))
+    causal_mask = (
+        torch.tril(torch.ones((q.shape[-2], k.shape[-2]))).to(
+            dtype=torch.bool, device="cuda"
+        )
+        if is_causal
+        else None
+    )
+    functions.scaled_dot_product_attention(q=q, k=k, v=v, mask=causal_mask).backward(do)
+    expected_dq, expected_dk, expected_dv = q.grad, k.grad, v.grad
+    q, k, v, do = get_attention_inputs(with_head, device=torch.device("cuda"))
+
+    torch.compile(triton_functions.FlashAttention2.apply(q, k, v, is_causal).backward)(
+        do
+    )
 
     torch.testing.assert_close(q.grad, expected_dq, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(k.grad, expected_dk, rtol=1e-2, atol=1e-2)
