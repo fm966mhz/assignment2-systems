@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 
 from jaxtyping import Float
+from torch.library import triton_op
+from torch.library import wrap_triton
 
 
 @triton.jit
@@ -252,6 +254,47 @@ class WeightedSumFunc(torch.autograd.Function):
         return grad_x.view(input_shape), grad_weight
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
+        ),
+    ],
+    key=["S", "T"],
+)
 @triton.jit
 def flash_fwd_kernal(
     Q_ptr: tl.tensor,
@@ -344,13 +387,12 @@ def flash_fwd_kernal(
         v_t = tl.load(
             V_block_ptr, boundary_check=(0, 1), padding_option="zero"
         )  # K_TILE_SIZE D
+        k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        mask_t = k_indices < T
         S_st = tl.dot(q_s, k_t) * scale_factor  # Q_TILE_SIZE K_TILE_SIZE
+        S_st = tl.where(mask_t[None, :], S_st, -1.0e6)
         if is_causal:
-            k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            causal_mask_matrix = tl.where(
-                q_indices[:, None] >= k_indices[None, :], 0.0, -1.0e6
-            )
-            S_st += causal_mask_matrix
+            S_st = tl.where(q_indices[:, None] >= k_indices[None, :], S_st, -1.0e6)
         m_s_old = m_s
         m_s = tl.maximum(m_s, tl.max(S_st, axis=-1))
         exp_neg_m_s_diff = tl.exp(m_s_old - m_s)  # Q_TILE_SIZE
@@ -383,8 +425,6 @@ class FlashAttention2(torch.autograd.Function):
         K: Float[torch.Tensor, "... T D"],
         V: Float[torch.Tensor, "... T D"],
         is_causal: bool = False,
-        q_tile_size: int = 16,
-        k_tile_size: int = 16,
     ) -> Float[torch.Tensor, "... S D"]:
         """Forward pass."""
         input_batch_shape = Q.shape[:-2]
@@ -404,7 +444,6 @@ class FlashAttention2(torch.autograd.Function):
         K = K.view((-1, T, D))
         V = V.view((-1, T, D))
         scale_factor = 1.0 / (D**0.5)
-        num_tiles_q = triton.cdiv(S, q_tile_size)
         # 16 is the min size of the inner dimension for dot product.
         d_block_shape = max(16, triton.next_power_of_2(D))  # type: ignore
         O = torch.empty_like(Q, dtype=Q.dtype).to(Q.device)
@@ -413,9 +452,9 @@ class FlashAttention2(torch.autograd.Function):
         # graph. It will be aggressively optimized away by `torch.compile` (Inductor) and never gets
         # materialized. When the Triton kernel tries to write to it, it will cause an illegal memory
         # access error and crash the program!
-
         L = torch.zeros(Q.shape[:-1], dtype=Q.dtype).to(Q.device)
-        flash_fwd_kernal[(num_tiles_q, Q.shape[0])](
+        grid = lambda meta: (triton.cdiv(S, meta["Q_TILE_SIZE"]), Q.shape[0])
+        flash_fwd_kernal[grid](
             Q,  # type: ignore
             K,  # type: ignore
             V,  # type: ignore
@@ -439,11 +478,10 @@ class FlashAttention2(torch.autograd.Function):
             T,  # type: ignore
             D,  # type: ignore
             scale_factor,  # type: ignore
-            is_causal,  # type: ignore
-            d_block_shape,  # type:ignore
-            q_tile_size,  # type: ignore
-            k_tile_size,  # type: ignore
+            is_causal=is_causal,  # type: ignore
+            D_BLOCK_SHAPE=d_block_shape,  # type:ignore
         )
+        # print(f"Best config: {flash_fwd_kernal.best_config}")
         ctx.save_for_backward(O, L, Q, K, V)
         ctx.is_causal = is_causal  # type: ignore
         return O.view(input_batch_shape + (S, D))
@@ -456,8 +494,6 @@ class FlashAttention2(torch.autograd.Function):
         Float[torch.Tensor, "... S D"],
         Float[torch.Tensor, "... T D"],
         Float[torch.Tensor, "... T D"],
-        None,
-        None,
         None,
     ]:
         """Backward pass."""
@@ -509,7 +545,5 @@ class FlashAttention2(torch.autograd.Function):
             dQ.view(input_batch_shape + (S, D)),
             dK.view(input_batch_shape + (T, D)),
             dV.view(input_batch_shape + (T, D)),
-            None,
-            None,
             None,
         )
