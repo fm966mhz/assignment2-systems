@@ -254,49 +254,22 @@ class WeightedSumFunc(torch.autograd.Function):
         return grad_x.view(input_shape), grad_weight
 
 
+def flash_attention_get_configs():
+    return [
+        triton.Config(
+            {"Q_TILE_SIZE": 2**i, "K_TILE_SIZE": 2**i}, num_stages=s, num_warps=w
+        )
+        for i in range(4, 10)
+        for s, w in [(3, 4), (6, 8)]
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
-        ),
-    ],
+    configs=flash_attention_get_configs(),
     key=["S", "T"],
 )
 @triton.jit
-def flash_fwd_kernal(
+def flash_fwd_kernel(
     Q_ptr: tl.tensor,
     K_ptr: tl.tensor,
     V_ptr: tl.tensor,
@@ -384,7 +357,16 @@ def flash_fwd_kernal(
     l_s = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_s = tl.full((Q_TILE_SIZE,), -1.0e6, dtype=tl.float32)
     q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-    for k_tile_index in tl.range(tl.cdiv(T, K_TILE_SIZE)):
+    # Early exit if the current max Q index is smaller than the smallest k index in the current K
+    # tile. Mathematically, this means `k_tile_index` needs to satisfy the following inequality:
+    #
+    #     k_tile_index * K_TILE_SIZE < (q_tile_index + 1) * Q_TILE_SIZE
+    #
+    # in order for there to be any meaningful computation for that particular k tile.
+    max_k_index = T
+    if is_causal:
+        max_k_index = tl.minimum(max_k_index, (q_tile_index + 1) * Q_TILE_SIZE)
+    for k_tile_index in tl.range(tl.cdiv(max_k_index, K_TILE_SIZE)):
         k_t = tl.trans(
             tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero"), (1, 0)
         )  # D K_TILE_SIZE
@@ -420,44 +402,7 @@ def flash_fwd_kernal(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
-        ),
-    ],
+    configs=flash_attention_get_configs(),
     key=["S", "T"],
 )
 @triton.jit
@@ -575,7 +520,10 @@ def flash_bwd_dq_kernel(
     do_s = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
     dq_s = tl.zeros((Q_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
     q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-    for k_tile_index in tl.range(tl.cdiv(T, K_TILE_SIZE)):
+    max_k_index = T
+    if is_causal:
+        max_k_index = tl.minimum(max_k_index, (q_tile_index + 1) * Q_TILE_SIZE)
+    for k_tile_index in tl.range(tl.cdiv(max_k_index, K_TILE_SIZE)):
         k_t = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v_t = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
@@ -598,44 +546,7 @@ def flash_bwd_dq_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
-        ),
-        triton.Config(
-            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
-        ),
-    ],
+    configs=flash_attention_get_configs(),
     key=["S", "T"],
 )
 @triton.jit
@@ -696,11 +607,19 @@ def flash_bwd_dk_dv_kernel(
     k_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
 
+    # Similar to the forward pass, we can skip tiles that are not needed for the current k tile due
+    # to the causal mask.
+    min_q_tile_index = 0
+    if is_causal:
+        min_q_tile_index = tl.floor(k_tile_index * K_TILE_SIZE / Q_TILE_SIZE).to(
+            tl.int32
+        )
+
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + batch_index * stride_q_b,
         shape=(S, D),
         strides=(stride_q_s, stride_q_d),
-        offsets=(0, 0),
+        offsets=(min_q_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
         order=(1, 0),
     )
@@ -724,7 +643,7 @@ def flash_bwd_dk_dv_kernel(
         O_ptr + batch_index * stride_o_b,
         shape=(S, D),
         strides=(stride_o_s, stride_o_d),
-        offsets=(0, 0),
+        offsets=(min_q_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
         order=(1, 0),
     )
@@ -732,7 +651,7 @@ def flash_bwd_dk_dv_kernel(
         L_ptr + batch_index * stride_l_b,
         shape=(S,),
         strides=(stride_l_s,),
-        offsets=(0,),
+        offsets=(min_q_tile_index * Q_TILE_SIZE,),
         block_shape=(Q_TILE_SIZE,),
         order=(0,),
     )
@@ -740,7 +659,7 @@ def flash_bwd_dk_dv_kernel(
         dO_ptr + batch_index * stride_do_b,
         shape=(S, D),
         strides=(stride_do_s, stride_do_d),
-        offsets=(0, 0),
+        offsets=(min_q_tile_index * Q_TILE_SIZE, 0),
         block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
         order=(1, 0),
     )
@@ -766,7 +685,7 @@ def flash_bwd_dk_dv_kernel(
     dv_t = tl.zeros((K_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
     k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
 
-    for q_tile_index in tl.range(tl.cdiv(S, Q_TILE_SIZE)):
+    for q_tile_index in tl.range(min_q_tile_index, tl.cdiv(S, Q_TILE_SIZE)):
         q_s = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
         o_s = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
         l_s = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
@@ -835,7 +754,7 @@ class FlashAttention2(torch.autograd.Function):
         # access error and crash the program!
         L = torch.zeros(Q.shape[:-1], dtype=Q.dtype).to(Q.device)
         grid = lambda meta: (triton.cdiv(S, meta["Q_TILE_SIZE"]), Q.shape[0])
-        flash_fwd_kernal[grid](
+        flash_fwd_kernel[grid](
             Q,  # type: ignore
             K,  # type: ignore
             V,  # type: ignore

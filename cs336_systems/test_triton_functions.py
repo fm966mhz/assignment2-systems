@@ -46,7 +46,7 @@ def get_attention_inputs(with_head: bool, device: torch.device) -> tuple[
     Float[torch.Tensor, "... S D"],
 ]:
     torch.manual_seed(42)
-    B, S, T, D = 4, 64, 32, 6
+    B, S, T, D = 4, 256, 128, 64
     H = 8
     if with_head:
         return (
