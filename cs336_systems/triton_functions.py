@@ -324,7 +324,11 @@ def flash_fwd_kernal(
     S: int,
     T: int,
     D: int,
-    scale_factor: float,
+    # scale factor is 1.0 / sqrt(D). We use a `tl.constexpr` instead of a `float` because the latter
+    # doesn't work well with `torch.compile`. Somehow with a float, the program will crash when
+    # launching the CUDA kernal with the error of
+    # "TypeError: 'float' object cannot be interpreted as an integer".
+    scale_factor: tl.constexpr,
     is_causal: tl.constexpr,
     D_BLOCK_SHAPE: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
@@ -380,7 +384,7 @@ def flash_fwd_kernal(
     l_s = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_s = tl.full((Q_TILE_SIZE,), -1.0e6, dtype=tl.float32)
     q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-    for k_tile_index in range(tl.cdiv(T, K_TILE_SIZE)):
+    for k_tile_index in tl.range(tl.cdiv(T, K_TILE_SIZE)):
         k_t = tl.trans(
             tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero"), (1, 0)
         )  # D K_TILE_SIZE
@@ -413,6 +417,383 @@ def flash_fwd_kernal(
     # `O_block_ptr`.
     tl.store(O_block_ptr, o_s.cast(O_block_ptr.dtype.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, l_s.cast(L_block_ptr.dtype.element_ty), boundary_check=(0,))
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
+        ),
+    ],
+    key=["S", "T"],
+)
+@triton.jit
+def flash_bwd_dq_kernel(
+    Q_ptr: tl.tensor,
+    K_ptr: tl.tensor,
+    V_ptr: tl.tensor,
+    O_ptr: tl.tensor,
+    L_ptr: tl.tensor,
+    dO_ptr: tl.tensor,
+    dQ_ptr: tl.tensor,
+    # Q strides.
+    stride_q_b: int,
+    stride_q_s: int,
+    stride_q_d: int,
+    # K strides.
+    stride_k_b: int,
+    stride_k_t: int,
+    stride_k_d: int,
+    # V strides.
+    stride_v_b: int,
+    stride_v_t: int,
+    stride_v_d: int,
+    # O strides.
+    stride_o_b: int,
+    stride_o_s: int,
+    stride_o_d: int,
+    # L strides.
+    stride_l_b: int,
+    stride_l_s: int,
+    # dO strides.
+    stride_do_b: int,
+    stride_do_s: int,
+    stride_do_d: int,
+    # dQ strides.
+    stride_dq_b: int,
+    stride_dq_s: int,
+    stride_dq_d: int,
+    S: int,
+    T: int,
+    D: int,
+    # scale factor is 1.0 / sqrt(D). We use a `tl.constexpr` instead of a `float` because the latter
+    # doesn't work well with `torch.compile`. Somehow with a float, the program will crash when
+    # launching the CUDA kernal with the error of
+    # "TypeError: 'float' object cannot be interpreted as an integer".
+    scale_factor: tl.constexpr,
+    is_causal: tl.constexpr,
+    D_BLOCK_SHAPE: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    """Flash Attention 2 backward pass for dQ."""
+    q_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_q_b,
+        shape=(S, D),
+        strides=(stride_q_s, stride_q_d),
+        offsets=(q_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_k_b,
+        shape=(T, D),
+        strides=(stride_k_t, stride_k_d),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_v_b,
+        shape=(T, D),
+        strides=(stride_v_t, stride_v_d),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_o_b,
+        shape=(S, D),
+        strides=(stride_o_s, stride_o_d),
+        offsets=(q_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_l_b,
+        shape=(S,),
+        strides=(stride_l_s,),
+        offsets=(Q_TILE_SIZE * q_tile_index,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_do_b,
+        shape=(S, D),
+        strides=(stride_do_s, stride_do_d),
+        offsets=(q_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    dQ_block_ptr = tl.make_block_ptr(
+        dQ_ptr + batch_index * stride_dq_b,
+        shape=(S, D),
+        strides=(stride_dq_s, stride_dq_d),
+        offsets=(q_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    q_s = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    o_s = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    l_s = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+    do_s = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    dq_s = tl.zeros((Q_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
+    q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    for k_tile_index in tl.range(tl.cdiv(T, K_TILE_SIZE)):
+        k_t = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        v_t = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        S_st = tl.dot(q_s, tl.trans(k_t, (1, 0))) * scale_factor
+        S_st = tl.where(k_indices < T, S_st, -1.0e6)
+        if is_causal:
+            S_st = tl.where(q_indices[:, None] >= k_indices[None, :], S_st, -1.0e6)
+        P_st = tl.exp(S_st - tl.expand_dims(l_s, axis=-1))
+        dP_st = tl.dot(do_s, tl.trans(v_t, (1, 0)))
+        D_s = tl.sum(o_s * do_s, axis=-1, keep_dims=True)
+        dS_st = P_st * (dP_st - D_s)
+        dq_s += tl.dot(dS_st, k_t) * scale_factor
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    tl.store(
+        dQ_block_ptr, dq_s.cast(dQ_block_ptr.dtype.element_ty), boundary_check=(0, 1)
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 256, "K_TILE_SIZE": 256}, num_stages=6, num_warps=8
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"Q_TILE_SIZE": 512, "K_TILE_SIZE": 512}, num_stages=6, num_warps=8
+        ),
+    ],
+    key=["S", "T"],
+)
+@triton.jit
+def flash_bwd_dk_dv_kernel(
+    Q_ptr: tl.tensor,
+    K_ptr: tl.tensor,
+    V_ptr: tl.tensor,
+    O_ptr: tl.tensor,
+    L_ptr: tl.tensor,
+    dO_ptr: tl.tensor,
+    dK_ptr: tl.tensor,
+    dV_ptr: tl.tensor,
+    # Q strides.
+    stride_q_b: int,
+    stride_q_s: int,
+    stride_q_d: int,
+    # K strides.
+    stride_k_b: int,
+    stride_k_t: int,
+    stride_k_d: int,
+    # V strides.
+    stride_v_b: int,
+    stride_v_t: int,
+    stride_v_d: int,
+    # O strides.
+    stride_o_b: int,
+    stride_o_s: int,
+    stride_o_d: int,
+    # L strides.
+    stride_l_b: int,
+    stride_l_s: int,
+    # dO strides.
+    stride_do_b: int,
+    stride_do_s: int,
+    stride_do_d: int,
+    # dK strides.
+    stride_dk_b: int,
+    stride_dk_t: int,
+    stride_dk_d: int,
+    # dV strides.
+    stride_dv_b: int,
+    stride_dv_t: int,
+    stride_dv_d: int,
+    S: int,
+    T: int,
+    D: int,
+    # scale factor is 1.0 / sqrt(D). We use a `tl.constexpr` instead of a `float` because the latter
+    # doesn't work well with `torch.compile`. Somehow with a float, the program will crash when
+    # launching the CUDA kernal with the error of
+    # "TypeError: 'float' object cannot be interpreted as an integer".
+    scale_factor: tl.constexpr,
+    is_causal: tl.constexpr,
+    D_BLOCK_SHAPE: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    """Flash Attention 2 backward pass for dQ."""
+    k_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_q_b,
+        shape=(S, D),
+        strides=(stride_q_s, stride_q_d),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_k_b,
+        shape=(T, D),
+        strides=(stride_k_t, stride_k_d),
+        offsets=(k_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_v_b,
+        shape=(T, D),
+        strides=(stride_v_t, stride_v_d),
+        offsets=(k_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_o_b,
+        shape=(S, D),
+        strides=(stride_o_s, stride_o_d),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_l_b,
+        shape=(S,),
+        strides=(stride_l_s,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_do_b,
+        shape=(S, D),
+        strides=(stride_do_s, stride_do_d),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr + batch_index * stride_dk_b,
+        shape=(T, D),
+        strides=(stride_dk_t, stride_dk_d),
+        offsets=(k_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_index * stride_dv_b,
+        shape=(T, D),
+        strides=(stride_dv_t, stride_dv_d),
+        offsets=(k_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, D_BLOCK_SHAPE),
+        order=(1, 0),
+    )
+    k_t = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    v_t = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    dk_t = tl.zeros((K_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
+    dv_t = tl.zeros((K_TILE_SIZE, D_BLOCK_SHAPE), dtype=tl.float32)
+    k_indices = k_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+
+    for q_tile_index in tl.range(tl.cdiv(S, Q_TILE_SIZE)):
+        q_s = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        o_s = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        l_s = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+        do_s = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        q_indices = q_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+        S_st = tl.dot(q_s, tl.trans(k_t, (1, 0))) * scale_factor
+        S_st = tl.where(k_indices < T, S_st, -1.0e6)
+        if is_causal:
+            S_st = tl.where(q_indices[:, None] >= k_indices[None, :], S_st, -1.0e6)
+        P_st = tl.exp(S_st - l_s[:, None])
+        dP_st = tl.dot(do_s, tl.trans(v_t, (1, 0)))
+        D_s = tl.sum(o_s * do_s, axis=-1, keep_dims=True)
+        dS_st = P_st * (dP_st - D_s)
+        dk_t += tl.dot(tl.trans(dS_st, (1, 0)), q_s) * scale_factor
+        dv_t += tl.dot(tl.trans(P_st, (1, 0)), do_s)
+
+        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+        O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+
+    tl.store(
+        dK_block_ptr, dk_t.cast(dK_block_ptr.dtype.element_ty), boundary_check=(0, 1)
+    )
+    tl.store(
+        dV_block_ptr, dv_t.cast(dV_block_ptr.dtype.element_ty), boundary_check=(0, 1)
+    )
 
 
 class FlashAttention2(torch.autograd.Function):
@@ -477,7 +858,7 @@ class FlashAttention2(torch.autograd.Function):
             S,  # type: ignore
             T,  # type: ignore
             D,  # type: ignore
-            scale_factor,  # type: ignore
+            scale_factor=scale_factor,  # type: ignore
             is_causal=is_causal,  # type: ignore
             D_BLOCK_SHAPE=d_block_shape,  # type:ignore
         )
@@ -503,43 +884,87 @@ class FlashAttention2(torch.autograd.Function):
         S, D = dO.shape[-2:]
         T = K.shape[-2]
         dO = dO.view((-1, S, D))
-
-        def _backward_impl(
-            dO: Float[torch.Tensor, "B S D"],
-            O: Float[torch.Tensor, "B S D"],
-            L: Float[torch.Tensor, "B S"],
-            Q: Float[torch.Tensor, "B S D"],
-            K: Float[torch.Tensor, "B T D"],
-            V: Float[torch.Tensor, "B T D"],
-            sqrt_d: float,
-            is_causal: bool = False,
-        ) -> tuple[
-            Float[torch.Tensor, "B S D"],
-            Float[torch.Tensor, "B T D"],
-            Float[torch.Tensor, "B T D"],
-        ]:
-            S = einops.einsum(Q, K, "B S D, B T D -> B S T") / sqrt_d
-            q_seq_len, k_seq_len = S.shape[-2:]
-            # Let S' = S + causal_mask, we have dS' = dS, so we only need to update S for the
-            # situations with `is_causal = True`.
-            if is_causal:
-                S = torch.where(
-                    torch.arange(q_seq_len, device=S.device)[None, :, None]
-                    >= torch.arange(k_seq_len, device=S.device)[None, None, :],
-                    S,
-                    -1e6,
-                )
-            P = torch.exp(S - L.unsqueeze(dim=-1))
-            dV = einops.einsum(P, dO, "B S T, B S D -> B T D")
-            dP = einops.einsum(dO, V, "B S D, B T D -> B S T")
-            dS = P * (dP - einops.reduce(O * dO, "B S D -> B S 1", reduction="sum"))
-            dQ = einops.einsum(dS, K, "B S T, B T D -> B S D") / sqrt_d
-            dK = einops.einsum(dS, Q, "B S T, B S D -> B T D") / sqrt_d
-            return dQ, dK, dV
-
-        compiled_backward_impl = torch.compile(_backward_impl)
-        dQ, dK, dV = compiled_backward_impl(
-            dO, O, L, Q, K, V, np.sqrt(D), ctx.is_causal  # type:ignore
+        dQ = torch.empty_like(Q, dtype=Q.dtype).to(Q.device)
+        dK = torch.empty_like(K, dtype=K.dtype).to(K.device)
+        dV = torch.empty_like(V, dtype=V.dtype).to(V.device)
+        scale_factor = 1.0 / (D**0.5)
+        # 16 is the min size of the inner dimension for dot product.
+        d_block_shape = max(16, triton.next_power_of_2(D))  # type: ignore
+        grid_dq = lambda meta: (triton.cdiv(S, meta["Q_TILE_SIZE"]), Q.shape[0])
+        flash_bwd_dq_kernel[grid_dq](
+            Q,  # type: ignore
+            K,  # type: ignore
+            V,  # type: ignore
+            O,  # type: ignore
+            L,  # type: ignore
+            dO,  # type: ignore
+            dQ,  # type: ignore
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            L.stride(0),
+            L.stride(1),
+            dO.stride(0),
+            dO.stride(1),
+            dO.stride(2),
+            dQ.stride(0),
+            dQ.stride(1),
+            dQ.stride(2),
+            S,  # type: ignore
+            T,  # type: ignore
+            D,  # type: ignore
+            scale_factor=scale_factor,  # type: ignore
+            is_causal=ctx.is_causal,  # type: ignore
+            D_BLOCK_SHAPE=d_block_shape,  # type:ignore
+        )
+        grid_dk_dv = lambda meta: (triton.cdiv(T, meta["K_TILE_SIZE"]), Q.shape[0])
+        flash_bwd_dk_dv_kernel[grid_dk_dv](
+            Q,  # type: ignore
+            K,  # type: ignore
+            V,  # type: ignore
+            O,  # type: ignore
+            L,  # type: ignore
+            dO,  # type: ignore
+            dK,  # type: ignore
+            dV,  # type: ignore
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            L.stride(0),
+            L.stride(1),
+            dO.stride(0),
+            dO.stride(1),
+            dO.stride(2),
+            dK.stride(0),
+            dK.stride(1),
+            dK.stride(2),
+            dV.stride(0),
+            dV.stride(1),
+            dV.stride(2),
+            S,  # type: ignore
+            T,  # type: ignore
+            D,  # type: ignore
+            scale_factor=scale_factor,  # type: ignore
+            is_causal=ctx.is_causal,  # type: ignore
+            D_BLOCK_SHAPE=d_block_shape,  # type:ignore
         )
         return (
             dQ.view(input_batch_shape + (S, D)),
