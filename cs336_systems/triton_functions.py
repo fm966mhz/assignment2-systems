@@ -255,12 +255,16 @@ class WeightedSumFunc(torch.autograd.Function):
 
 
 def flash_attention_get_configs():
+    """Gets the configs for the flash attention forward and backward passes.
+
+    Turned out that the SRAM on my 5080 if very limited. The max tile size I can use is 16 as tested
+    in `flash_attention_benchmarking_main.py`.
+    """
     return [
         triton.Config(
-            {"Q_TILE_SIZE": 2**i, "K_TILE_SIZE": 2**i}, num_stages=s, num_warps=w
+            {"Q_TILE_SIZE": 2**i, "K_TILE_SIZE": 2**i}, num_stages=3, num_warps=4
         )
-        for i in range(4, 10)
-        for s, w in [(3, 4), (6, 8)]
+        for i in range(4, 5)
     ]
 
 
@@ -535,7 +539,7 @@ def flash_bwd_dq_kernel(
         dP_st = tl.dot(do_s, tl.trans(v_t, (1, 0)))
         D_s = tl.sum(o_s * do_s, axis=-1, keep_dims=True)
         dS_st = P_st * (dP_st - D_s)
-        dq_s += tl.dot(dS_st, k_t) * scale_factor
+        dq_s += tl.dot(dS_st.cast(k_t.dtype), k_t) * scale_factor
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -699,8 +703,8 @@ def flash_bwd_dk_dv_kernel(
         dP_st = tl.dot(do_s, tl.trans(v_t, (1, 0)))
         D_s = tl.sum(o_s * do_s, axis=-1, keep_dims=True)
         dS_st = P_st * (dP_st - D_s)
-        dk_t += tl.dot(tl.trans(dS_st, (1, 0)), q_s) * scale_factor
-        dv_t += tl.dot(tl.trans(P_st, (1, 0)), do_s)
+        dk_t += tl.dot(tl.trans(dS_st.cast(q_s.dtype), (1, 0)), q_s) * scale_factor
+        dv_t += tl.dot(tl.trans(P_st.cast(do_s.dtype), (1, 0)), do_s)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE, 0))
