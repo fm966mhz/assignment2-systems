@@ -4,6 +4,7 @@ from typing import Type
 
 import torch
 
+from cs336_systems import ddp_container
 from cs336_systems import pytorch_functions
 from cs336_systems import triton_functions
 
@@ -55,7 +56,7 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDPIndividualParameters(module)
-    raise NotImplementedError
+    return ddp_container.DDPContainer(module)
 
 
 def ddp_individual_parameters_on_after_backward(
@@ -72,7 +73,7 @@ def ddp_individual_parameters_on_after_backward(
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    ddp_model.finish_gradient_syncronization()
 
 
 def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn.Module:
